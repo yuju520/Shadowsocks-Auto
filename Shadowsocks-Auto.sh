@@ -11,18 +11,6 @@ PLAIN='\033[0m'
 SS_CONFIG_PATH="/etc/shadowsocks/config.json"
 STLS_CONFIG_PATH="/etc/systemd/system/shadow-tls.service"
 
-# 获取公网 IP 地址
-get_public_ip() {
-    public_ip=$(curl -s -m 10 https://api.ipify.org || \
-              curl -s -m 10 https://api.ip.sb/ip || \
-              curl -s -m 10 https://icanhazip.com)
-  
-    if [[ -z "$public_ip" ]]; then
-        echo "无法获取公网 IP 地址，将使用内网 IP 地址"
-        public_ip=$(hostname -I | awk '{print $1}')
-    fi
-}
-
 # 检查是否为 root 用户
 check_root() {
     if [[ $EUID -ne 0 ]]; then
@@ -31,620 +19,511 @@ check_root() {
     fi
 }
 
-# 检查并安装工具
+# Shadowsocks 双后端管理。Snap 与独立二进制共用节点信息。
+SS_STATE_DIR="/etc/shadowsocks"
+SS_BINARY_CONFIG="/etc/shadowsocks/config.json"
+SS_SNAP_CONFIG="/var/snap/shadowsocks-rust/common/etc/shadowsocks-rust/config.json"
+SS_UNIT="/etc/systemd/system/shadowsocks.service"
+SS_BACKEND_FILE="/etc/shadowsocks/backend"
+SS_SNAP_APP="shadowsocks-rust.ssserver-daemon"
+SS_BACKEND=""
+SS_REQUESTED_BACKEND="${SS_BACKEND_MODE:-auto}"
+
+ss_error() { printf '%s\n' "错误：$*" >&2; }
+
+check_system() {
+    [[ "$(uname -s)" == Linux ]] || { ss_error "仅支持 Linux。"; return 1; }
+    command -v systemctl >/dev/null && [[ -d /run/systemd/system ]] || {
+        ss_error "需要正在运行的 systemd；不支持未启用 systemd 的容器。"; return 1;
+    }
+}
+
 check_tool() {
-    local tools=("xz" "wget" "curl" "jq")
-    local PM
-
-    # 确定包管理器
-    if command -v apt &> /dev/null; then
-        PM="apt"
-    elif command -v yum &> /dev/null; then
-        PM="yum"
-    elif command -v dnf &> /dev/null; then
-        PM="dnf"
-    else
-        echo -e "${RED}无法确定包管理器，请手动安装以下工具：${tools[*]}${PLAIN}"
-        exit 1
-    fi
-
-    # 收集需要安装的包
+    local tool pkg pm
     local pkgs=()
-    for tool in "${tools[@]}"; do
-        if ! command -v "$tool" &> /dev/null; then
-            case "$PM" in
-                apt)
-                    case "$tool" in
-                        xz) pkgs+=("xz-utils") ;;
-                        *) pkgs+=("$tool") ;;
-                    esac
-                    ;;
-                yum|dnf)
-                    pkgs+=("$tool")
-                    ;;
-            esac
-            echo -e "${YELLOW}检测到 $tool 未安装，将进行安装${PLAIN}"
-        else
-            echo -e "${GREEN}$tool 已安装${PLAIN}"
-        fi
+    if command -v apt-get >/dev/null; then pm=apt-get
+    elif command -v dnf >/dev/null; then pm=dnf
+    elif command -v yum >/dev/null; then pm=yum
+    else ss_error "需要 apt-get、dnf 或 yum。"; return 1; fi
+    for tool in curl jq openssl tar xz sha256sum ss timeout flock wget; do
+        command -v "$tool" >/dev/null && continue
+        pkg="$tool"
+        case "$tool" in
+            xz) [[ "$pm" == apt-get ]] && pkg=xz-utils ;;
+            sha256sum) pkg=coreutils ;;
+            timeout) pkg=coreutils ;;
+            flock) pkg=util-linux ;;
+            ss) [[ "$pm" == apt-get ]] && pkg=iproute2 || pkg=iproute ;;
+        esac
+        pkgs+=("$pkg")
     done
-
-    # 安装缺失的包
-    if [ ${#pkgs[@]} -gt 0 ]; then
-        echo -e "${YELLOW}正在安装缺失工具：${pkgs[*]}...${PLAIN}"
-        if [ "$PM" = "apt" ]; then
-            apt update && apt install -y "${pkgs[@]}" || {
-                echo -e "${RED}安装失败，请检查网络或手动安装${PLAIN}"
-                exit 1
-            }
+    if ((${#pkgs[@]})); then
+        if [[ "$pm" == apt-get ]]; then
+            apt-get update && apt-get install -y ca-certificates "${pkgs[@]}" || return 1
         else
-            $PM install -y "${pkgs[@]}" || {
-                echo -e "${RED}安装失败，请检查网络或手动安装${PLAIN}"
-                exit 1
-            }
+            "$pm" install -y ca-certificates "${pkgs[@]}" || return 1
         fi
-        echo -e "${GREEN}所有工具安装成功${PLAIN}"
     fi
 }
 
-# ===== Shadowsocks 功能 =====
-
-# 安装Shadowsocks服务
-install_shadowsocks() {
-    echo -e "${BLUE}开始安装 Shadowsocks 服务...${PLAIN}"
-    
-    # 检查和安装xz工具
-    check_tool
-
-    # 获取系统架构 (x86_64, i686, aarch64, armv7, arm)
-    ARCH=$(uname -m)
-
-    # 根据系统架构选择对应的下载后缀
-    case "$ARCH" in
-        x86_64)
-            ARCH_SUFFIX="x86_64-unknown-linux-gnu"
-            ;;
-        i686)
-            ARCH_SUFFIX="i686-unknown-linux-musl"
-            ;;
-        aarch64)
-            ARCH_SUFFIX="aarch64-unknown-linux-gnu"
-            ;;
-        armv7l)
-            ARCH_SUFFIX="armv7-unknown-linux-gnueabihf"
-            ;;
-        armv6l)
-            ARCH_SUFFIX="arm-unknown-linux-gnueabihf"
-            ;;
-        *)
-            echo -e "${RED}不支持的架构: $ARCH${PLAIN}"
-            exit 1
-            ;;
-    esac
-
-    # 获取 GitHub 最新 release 的信息
-    echo -e "${YELLOW}正在获取 Shadowsocks 最新版本信息...${PLAIN}"
-    local api_response
-    api_response=$(wget -qO- https://api.github.com/repos/shadowsocks/shadowsocks-rust/releases/latest)
-    if [ $? -ne 0 ]; then
-        echo -e "${RED}获取 GitHub 最新 release 信息失败${PLAIN}"
-        exit 1
-    fi
-    
-    LATEST_TAG=$(echo "$api_response" | grep '"tag_name"' | cut -d '"' -f 4)
-
-    if [ -z "$LATEST_TAG" ]; then
-        echo -e "${RED}无法获取最新版本信息${PLAIN}"
-        exit 1
-    fi
-
-    LATEST_RELEASE_URL="https://github.com/shadowsocks/shadowsocks-rust/releases/download/$LATEST_TAG/shadowsocks-$LATEST_TAG.$ARCH_SUFFIX.tar.xz"
-
-    # 检查当前安装的版本
-    local CURRENT_VERSION
-    if command -v ssserver &> /dev/null; then
-        CURRENT_VERSION=$(ssserver --version | awk '{print $2}')
-        CURRENT_VERSION="v$CURRENT_VERSION"
-    else
-        CURRENT_VERSION="未安装"
-    fi
-
-    # 判断是否需要更新
-    if [[ "$CURRENT_VERSION" != "$LATEST_TAG" ]]; then
-        if [[ "$CURRENT_VERSION" == "未安装" ]]; then
-            echo -e "${YELLOW}Shadowsocks 尚未安装，将安装最新版本: $LATEST_TAG${PLAIN}"
-        else
-            echo -e "${YELLOW}发现新版本: $LATEST_TAG，当前版本: $CURRENT_VERSION${PLAIN}"
-        fi
-        echo -e "${BLUE}正在下载最新版本...${PLAIN}"
-        wget -q "$LATEST_RELEASE_URL"
-        if [ $? -ne 0 ]; then
-            echo -e "${RED}下载失败，请检查网络连接或稍后重试${PLAIN}"
-            exit 1
-        fi
-        echo -e "${BLUE}下载完成，正在安装...${PLAIN}"
-        tar -Jxf shadowsocks-*.tar.xz -C /usr/local/bin/ 2>/dev/null
-        rm shadowsocks-*.tar.xz
-        echo -e "${GREEN}安装/更新完成${PLAIN}"
-    else
-        echo -e "${GREEN}当前已是最新版本: $CURRENT_VERSION，无需更新${PLAIN}"
-    fi
-
-    # 创建配置文件目录
-    mkdir -p /etc/shadowsocks
-
-    # 询问用户是否输入自定义端口
-    read -p "请输入自定义端口(1024-65535)，或按回车随机生成: " ss_port
-    # 检查自定义端口是否合法
-    if [[ -z "$ss_port" || ! "$ss_port" =~ ^[0-9]+$ || "$ss_port" -lt 1025 || "$ss_port" -gt 65535 ]]; then
-        echo -e "${YELLOW}无效的端口，使用随机生成的端口${PLAIN}"
-        ss_port=$(shuf -i 1024-65535 -n 1)
-    else
-        echo -e "${GREEN}使用自定义端口: $ss_port${PLAIN}"
-    fi
-
-    # 询问用户选择加密方法
-    echo -e "${BLUE}请选择加密方法（回车则默认为2022-blake3-aes-256-gcm）:${PLAIN}"
-    echo "1) 2022-blake3-aes-128-gcm"
-    echo "2) 2022-blake3-aes-256-gcm 【推荐】"
-    echo "3) 2022-blake3-chacha20-poly1305"
-    echo "4) aes-256-gcm"
-    echo "5) aes-128-gcm"
-    echo "6) chacha20-ietf-poly1305"
-    echo "7) none"
-    echo "8) aes-128-cfb"
-    echo "9) aes-192-cfb"
-    echo "10) aes-256-cfb"
-    echo "11) aes-128-ctr"
-    echo "12) aes-192-ctr"
-    echo "13) aes-256-ctr"
-    echo "14) camellia-128-cfb"
-    echo "15) camellia-192-cfb"
-    echo "16) camellia-256-cfb"
-    echo "17) rc4-md5"
-    echo "18) chacha20-ietf"
-
-    read -p "请输入选项数字 (默认为 2): " encryption_choice
-    # 如果用户没有输入，默认选择 2022-blake3-aes-256-gcm
-    encryption_choice=${encryption_choice:-2}
-
-    # 根据用户选择设置加密方法和密码
-    case $encryption_choice in
-        1)
-            method="2022-blake3-aes-128-gcm"
-            ss_password=$(openssl rand -base64 16)
-            ;;
-        2)
-            method="2022-blake3-aes-256-gcm"
-            ss_password=$(openssl rand -base64 32)
-            ;;
-        3)
-            method="2022-blake3-chacha20-poly1305"
-            ss_password=$(openssl rand -base64 32)
-            ;;
-        *)
-            case $encryption_choice in
-                4) method="aes-256-gcm" ;;
-                5) method="aes-128-gcm" ;;
-                6) method="chacha20-ietf-poly1305" ;;
-                7) method="none" ;;
-                8) method="aes-128-cfb" ;;
-                9) method="aes-192-cfb" ;;
-                10) method="aes-256-cfb" ;;
-                11) method="aes-128-ctr" ;;
-                12) method="aes-192-ctr" ;;
-                13) method="aes-256-ctr" ;;
-                14) method="camellia-128-cfb" ;;
-                15) method="camellia-192-cfb" ;;
-                16) method="camellia-256-cfb" ;;
-                17) method="rc4-md5" ;;
-                18) method="chacha20-ietf" ;;
-                *)
-                    echo -e "${YELLOW}无效选项，使用默认方法: 2022-blake3-aes-256-gcm${PLAIN}"
-                    method="2022-blake3-aes-256-gcm"
-                    ss_password=$(openssl rand -base64 32)
-                    ;;
-            esac
-            read -p "请输入自定义密码 (留空使用默认密码 'yuju.love'): " custom_password
-            if [[ -z "$custom_password" ]]; then
-                ss_password="yuju.love"
-            else
-                ss_password="$custom_password"
-				
-            fi
-            ;;
-    esac
-
-    # 询问用户是否输入自定义节点名称
-    read -p "请输入自定义节点名称 (回车则默认为 Shadowsocks-加密协议): " node_name
-    # 如果用户没有输入，使用默认节点名称
-    if [[ -z "$node_name" ]]; then
-        node_name="Shadowsocks-${method}"
-    fi
-
-    # 生成 Shadowsocks 配置文件（无论是否存在，都会覆盖）
-    echo -e "${BLUE}正在生成配置文件...${PLAIN}"
-    cat <<EOF >/etc/shadowsocks/config.json
-{
-    "server": "0.0.0.0",
-    "server_port": $ss_port,
-    "password": "$ss_password",
-    "method": "$method",
-    "fast_open": false,
-    "mode": "tcp_and_udp"
+ss_snap_installed() {
+    command -v snap >/dev/null && snap list shadowsocks-rust >/dev/null 2>&1
 }
-EOF
-    echo -e "${GREEN}配置文件已生成${PLAIN}"
 
-    # 生成 systemd 服务文件（无论是否存在，都会覆盖）
-    echo -e "${BLUE}正在生成服务文件...${PLAIN}"
-    cat <<EOF >/etc/systemd/system/shadowsocks.service
+ss_detect_backend() {
+    SS_BACKEND=""
+    if [[ -f "$SS_BACKEND_FILE" ]]; then
+        IFS= read -r SS_BACKEND < "$SS_BACKEND_FILE" || :
+    fi
+    case "$SS_BACKEND" in
+        binary|snap) ;;
+        *)
+            if systemctl is-active --quiet "snap.${SS_SNAP_APP}.service"; then SS_BACKEND=snap
+            elif [[ -f "$SS_UNIT" ]]; then SS_BACKEND=binary
+            elif ss_snap_installed; then SS_BACKEND=snap
+            else return 1; fi ;;
+    esac
+    ss_set_config_path
+}
+
+ss_set_config_path() {
+    if [[ "$SS_BACKEND" == snap ]]; then SS_CONFIG_PATH="$SS_SNAP_CONFIG"
+    else SS_CONFIG_PATH="$SS_BINARY_CONFIG"; fi
+}
+
+ss_service() {
+    local action=$1
+    if [[ "$SS_BACKEND" == snap ]]; then
+        case "$action" in
+            enable) snap start --enable "$SS_SNAP_APP" ;;
+            disable) snap stop --disable "$SS_SNAP_APP" ;;
+            active) systemctl is-active --quiet "snap.${SS_SNAP_APP}.service" ;;
+            *) snap "$action" "$SS_SNAP_APP" ;;
+        esac
+    else
+        case "$action" in
+            enable) systemctl enable --now shadowsocks.service ;;
+            disable) systemctl disable --now shadowsocks.service ;;
+            active) systemctl is-active --quiet shadowsocks.service ;;
+            *) systemctl "$action" shadowsocks.service ;;
+        esac
+    fi
+}
+
+ss_logs() {
+    if [[ "$SS_BACKEND" == snap ]]; then snap logs -n=30 "$SS_SNAP_APP" >&2
+    else journalctl -u shadowsocks.service -n 30 --no-pager >&2; fi
+}
+
+# 不仅检查 systemctl 返回值，还观察 TCP、UDP 是否都已监听。
+ss_wait_ready() {
+    local port=$1 i
+    for ((i=0; i<10; i++)); do
+        if ss_service active &&
+           ss -H -lnt "sport = :$port" | grep -q . &&
+           ss -H -lnu "sport = :$port" | grep -q .; then
+            sleep 1
+            ss_service active && return 0
+        fi
+        sleep 1
+    done
+    ss_logs
+    return 1
+}
+
+ss_fetch() {
+    curl --fail --location --silent --show-error --connect-timeout 15 \
+        --max-time 180 --retry 2 "$1" -o "$2"
+}
+
+ss_install_binary() {
+    local temp=$1 suffix api asset url digest bin
+    case "$(uname -m)" in
+        x86_64) suffix=x86_64-unknown-linux-musl ;;
+        i386|i486|i586|i686) suffix=i686-unknown-linux-musl ;;
+        aarch64|arm64) suffix=aarch64-unknown-linux-musl ;;
+        armv7l) suffix=armv7-unknown-linux-musleabihf ;;
+        armv6l) suffix=arm-unknown-linux-musleabihf ;;
+        *) ss_error "没有适配此架构的独立包，auto 模式将尝试 Snap。"; return 1 ;;
+    esac
+    api="$temp/release.json"
+    ss_fetch https://api.github.com/repos/shadowsocks/shadowsocks-rust/releases/latest "$api" || return 1
+    asset=$(jq -c --arg suffix ".$suffix.tar.xz" \
+        '[.assets[] | select(.name | endswith($suffix))] | if length == 1 then .[0] else empty end' "$api") || return 1
+    [[ -n "$asset" ]] || { ss_error "此版本没有 $suffix 包。"; return 1; }
+    url=$(jq -r '.browser_download_url' <<< "$asset")
+    [[ "$url" == https://github.com/shadowsocks/shadowsocks-rust/releases/download/* ]] || return 1
+    printf '下载 %s\n' "$(jq -r '.name' <<< "$asset")"
+    ss_fetch "$url" "$temp/server.tar.xz" || return 1
+    digest=$(jq -r '.digest // empty' <<< "$asset")
+    if [[ "$digest" =~ ^sha256:[a-fA-F0-9]{64}$ ]]; then
+        [[ "$(sha256sum "$temp/server.tar.xz" | awk '{print $1}')" == "${digest#sha256:}" ]] || {
+            ss_error "下载文件 SHA256 不匹配。"; return 1;
+        }
+    else
+        printf '上游未提供 SHA256 digest，使用 HTTPS 下载资产。\n' >&2
+    fi
+    mkdir -p "$temp/unpack" || return 1
+    # 只提取 ssserver，拒绝绝对路径、父路径以及链接。
+    bin=$(tar -tJf "$temp/server.tar.xz" | awk '$0=="ssserver" || $0=="./ssserver" {print; exit}')
+    [[ -n "$bin" ]] || { ss_error "归档中没有 ssserver。"; return 1; }
+    tar -xJf "$temp/server.tar.xz" -C "$temp/unpack" --no-same-owner "$bin" || return 1
+    [[ -f "$temp/unpack/ssserver" && ! -L "$temp/unpack/ssserver" ]] || return 1
+    chmod 755 "$temp/unpack/ssserver" || return 1
+    if ! timeout 15 "$temp/unpack/ssserver" --version >"$temp/binary.log" 2>&1; then
+        cat "$temp/binary.log" >&2
+        ss_error "二进制运行失败（可能是架构、内核或运行库兼容性）。"
+        return 1
+    fi
+    install -m 755 "$temp/unpack/ssserver" /usr/local/bin/ssserver || return 1
+    cat > "$SS_UNIT" <<'UNIT'
 [Unit]
-Description=Shadowsocks Server
-After=network.target
+Description=Shadowsocks Rust Server
+After=network-online.target
+Wants=network-online.target
 
 [Service]
+Type=simple
 ExecStart=/usr/local/bin/ssserver -c /etc/shadowsocks/config.json
-Restart=on-abort
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
-EOF
-    echo -e "${GREEN}服务文件已生成${PLAIN}"
-
-    # 重新加载 systemd 配置
+UNIT
     systemctl daemon-reload
-
-    # 启动 Shadowsocks 服务
-    echo -e "${BLUE}正在启动 Shadowsocks 服务...${PLAIN}"
-    systemctl start shadowsocks
-    if [ $? -eq 0 ]; then
-        echo -e "${GREEN}Shadowsocks 服务已成功启动${PLAIN}"
-    else
-        echo -e "${RED}启动 Shadowsocks 服务失败${PLAIN}"
-    fi
-
-    # 启用 Shadowsocks 服务自启动
-    echo -e "${BLUE}正在启用 Shadowsocks 服务自启动...${PLAIN}"
-    systemctl enable shadowsocks &>/dev/null
-    if [ $? -eq 0 ]; then
-        echo -e "${GREEN}Shadowsocks 服务已设置为开机自启动${PLAIN}"
-    else
-        echo -e "${RED}设置 Shadowsocks 服务自启动失败${PLAIN}"
-    fi
-
-    # 检查 Shadowsocks 服务状态
-    local systemctl_status
-    systemctl_status=$(systemctl is-active shadowsocks)
-    echo -e "${BLUE}Shadowsocks 的服务状态为：${GREEN}$systemctl_status${PLAIN}"
-    # 获取ip
-    get_public_ip
-    # 构建并输出 ss:// 格式的链接
-    base64_password=$(echo -n "$method:$ss_password" | base64 -w 0)
-    echo -e "${GREEN}Shadowsocks 节点信息: ss://${base64_password}@${public_ip}:$ss_port#$node_name${PLAIN}"
-    
-    # 记录配置信息供以后使用
-    cat <<EOF >/etc/shadowsocks/info.txt
-端口: $ss_port
-密码: $ss_password
-加密方法: $method
-节点名称: $node_name
-链接: ss://${base64_password}@${public_ip}:$ss_port#$node_name
-EOF
-    
-    echo -e "${GREEN}安装完成！配置信息已保存到 /etc/shadowsocks/info.txt${PLAIN}"
 }
 
-# 查看Shadowsocks服务状态
-check_shadowsocks_status() {
-    if ! command -v ssserver &> /dev/null; then
-        echo -e "${RED}Shadowsocks 未安装${PLAIN}"
-        return 1
+ss_install_snap() {
+    command -v apt-get >/dev/null || {
+        ss_error "本脚本的 Snap 自动部署仅支持 Debian/Ubuntu（apt-get）。"; return 1;
+    }
+    if ! command -v snap >/dev/null; then
+        apt-get update && apt-get install -y snapd || return 1
     fi
-    
-    echo -e "${BLUE}Shadowsocks 版本: ${PLAIN}$(ssserver --version)"
-    echo -e "${BLUE}服务状态: ${PLAIN}$(systemctl is-active shadowsocks)"
-    
+    systemctl enable --now snapd.socket || return 1
+    timeout 180 snap wait system seed.loaded || {
+        ss_error "snapd 初始化失败或超时；检查 journalctl -u snapd。"; return 1;
+    }
+    if ! ss_snap_installed; then
+        snap install shadowsocks-rust || {
+            ss_error "Snap 安装失败；请检查 snapd、SquashFS、挂载权限及商店连接。"; return 1;
+        }
+    fi
+    timeout 30 snap run shadowsocks-rust.ssserver --version || return 1
+    mkdir -p "$(dirname "$SS_SNAP_CONFIG")"
 }
-# 查看Shadowsocks配置文件
-check_shadowsocks_config() {
-    if [ -f "/etc/shadowsocks/info.txt" ]; then
-        echo -e "${BLUE}配置信息: ${PLAIN}"
-        cat /etc/shadowsocks/info.txt
-    else
-        echo -e "${BLUE}未检测到配置信息 ${PLAIN}"
-	fi
-}
-# 修改Shadowsocks配置文件
-modify_shadowsocks_config() {
-    if ! command -v ssserver &> /dev/null; then
-        echo -e "${RED}Shadowsocks 未安装，请先安装！${PLAIN}"
-        return 1
+
+ss_choose_config() {
+    local choice custom old_method="" old_password="" value
+    ss_port="" method="" ss_password="" node_name=""
+    if [[ -f "$SS_CONFIG_PATH" ]]; then
+        ss_port=$(jq -r '.server_port // empty' "$SS_CONFIG_PATH") || return 1
+        old_method=$(jq -r '.method // empty' "$SS_CONFIG_PATH")
+        old_password=$(jq -r '.password // empty' "$SS_CONFIG_PATH")
     fi
-    
-    if [ ! -f "$SS_CONFIG_PATH" ]; then
-        echo -e "${RED}配置文件不存在，请重新安装 Shadowsocks！${PLAIN}"
-        return 1
-    fi
-    
-    # 显示当前配置
-    echo -e "${BLUE}当前配置: ${PLAIN}"
-    local current_port=$(jq -r '.server_port' "$SS_CONFIG_PATH")
-    local current_method=$(jq -r '.method' "$SS_CONFIG_PATH")
-    local current_password=$(jq -r '.password' "$SS_CONFIG_PATH")
-    
-    echo -e "${GREEN}端口: $current_port${PLAIN}"
-    echo -e "${GREEN}加密方法: $current_method${PLAIN}"
-    echo -e "${GREEN}密码: $current_password${PLAIN}"
-    
-    # 询问是否修改端口
-    read -p "是否修改端口？(y/n，默认n): " change_port
-    local new_port=$current_port
-    
-    if [[ "$change_port" == "y" || "$change_port" == "Y" ]]; then
-        read -p "请输入新端口(1024-65535): " new_port
-        # 验证端口合法性
-        if [[ -z "$new_port" || ! "$new_port" =~ ^[0-9]+$ || "$new_port" -lt 1024 || "$new_port" -gt 65535 ]]; then
-            echo -e "${RED}无效的端口，使用原端口${PLAIN}"
-            new_port=$current_port
+    while true; do
+        read -r -p "监听端口（1024-65535，回车使用 ${ss_port:-随机端口}）: " value || return 1
+        value=${value:-${ss_port:-$((RANDOM + 20000))}}
+        if [[ "$value" =~ ^[0-9]{1,5}$ ]] && ((10#$value >= 1024 && 10#$value <= 65535)); then
+            ss_port=$((10#$value)); break
         fi
+        printf '端口无效，请重新输入。\n'
+    done
+    local methods=(
+        2022-blake3-aes-128-gcm 2022-blake3-aes-256-gcm 2022-blake3-chacha20-poly1305
+        aes-256-gcm aes-128-gcm chacha20-ietf-poly1305 none
+        aes-128-cfb aes-192-cfb aes-256-cfb aes-128-ctr aes-192-ctr aes-256-ctr
+        camellia-128-cfb camellia-192-cfb camellia-256-cfb rc4-md5 chacha20-ietf
+    )
+    for ((choice=0; choice<${#methods[@]}; choice++)); do
+        printf '%2s) %s\n' "$((choice+1))" "${methods[choice]}"
+    done
+    read -r -p "加密方法：输入编号或名称（回车 ${old_method:-2022-blake3-aes-256-gcm}）: " choice || return 1
+    choice=${choice:-${old_method:-2022-blake3-aes-256-gcm}}
+    if [[ "$choice" =~ ^[0-9]{1,2}$ ]] && ((10#$choice >= 1 && 10#$choice <= ${#methods[@]})); then
+        method=${methods[$((10#$choice-1))]}
+    else
+        for value in "${methods[@]}"; do [[ "$value" == "$choice" ]] && method=$value; done
     fi
-    
-    # 询问是否修改加密方法
-    read -p "是否修改加密方法？(y/n，默认n): " change_method
-    local new_method=$current_method
-    
-    if [[ "$change_method" == "y" || "$change_method" == "Y" ]]; then
-        echo -e "${BLUE}请选择新的加密方法:${PLAIN}"
-        echo "1) 2022-blake3-aes-128-gcm"
-        echo "2) 2022-blake3-aes-256-gcm 【推荐】"
-        echo "3) 2022-blake3-chacha20-poly1305"
-        echo "4) aes-256-gcm"
-        echo "5) aes-128-gcm"
-        echo "6) chacha20-ietf-poly1305"
-        echo "7) none"
-        echo "8) aes-128-cfb"
-        echo "9) aes-192-cfb"
-        echo "10) aes-256-cfb"
-        echo "11) aes-128-ctr"
-        echo "12) aes-192-ctr"
-        echo "13) aes-256-ctr"
-        echo "14) camellia-128-cfb"
-        echo "15) camellia-192-cfb"
-        echo "16) camellia-256-cfb"
-        echo "17) rc4-md5"
-        echo "18) chacha20-ietf"
-        
-        read -p "请输入选项数字: " encryption_choice
-        
-        case $encryption_choice in
-            1) new_method="2022-blake3-aes-128-gcm" ;;
-            2) new_method="2022-blake3-aes-256-gcm" ;;
-            3) new_method="2022-blake3-chacha20-poly1305" ;;
-            4) new_method="aes-256-gcm" ;;
-            5) new_method="aes-128-gcm" ;;
-            6) new_method="chacha20-ietf-poly1305" ;;
-            7) new_method="none" ;;
-            8) new_method="aes-128-cfb" ;;
-            9) new_method="aes-192-cfb" ;;
-            10) new_method="aes-256-cfb" ;;
-            11) new_method="aes-128-ctr" ;;
-            12) new_method="aes-192-ctr" ;;
-            13) new_method="aes-256-ctr" ;;
-            14) new_method="camellia-128-cfb" ;;
-            15) new_method="camellia-192-cfb" ;;
-            16) new_method="camellia-256-cfb" ;;
-            17) new_method="rc4-md5" ;;
-            18) new_method="chacha20-ietf" ;;
-            *)
-                echo -e "${YELLOW}无效选项，使用原方法${PLAIN}"
-                new_method=$current_method
-                ;;
+    [[ -n "$method" ]] || { ss_error "无效加密方法。"; return 1; }
+    read -r -s -p "密码（回车：同方法保留旧密码，否则随机生成）: " custom || return 1
+    printf '\n'
+    if [[ -n "$custom" ]]; then ss_password=$custom
+    elif [[ "$method" == "$old_method" && -n "$old_password" ]]; then ss_password=$old_password
+    else
+        case "$method" in
+            2022-blake3-aes-128-gcm) ss_password=$(openssl rand -base64 16) || return 1 ;;
+            *) ss_password=$(openssl rand -base64 32) || return 1 ;;
         esac
     fi
-    
-    # 询问是否修改密码
-    read -p "是否修改密码？(y/n，默认n): " change_password
-    local new_password=$current_password
-    
-    if [[ "$change_password" == "y" || "$change_password" == "Y" ]]; then
-	    # 根据加密方法自动生成或设置密码
-	    if [[ "$new_method" == "2022-blake3-aes-256-gcm" || "$new_method" == "2022-blake3-chacha20-poly1305" ]]; then
-		    new_password=$(openssl rand -base64 32)
-		    echo -e "${GREEN}已生成随机密码: $new_password${PLAIN}"
-	    elif [[ "$new_method" == "2022-blake3-aes-128-gcm" ]]; then
-		    new_password=$(openssl rand -base64 16)
-		    echo -e "${GREEN}已生成随机密码: $new_password${PLAIN}"
-	    else
-		    read -p "请输入新密码 (留空为默认密码 yuju.love): " custom_password
-		    if [[ -z "$custom_password" ]]; then
-			    new_password="yuju.love"
-			    echo -e "${GREEN}使用默认密码: $new_password${PLAIN}"
-		    else
-			    new_password="$custom_password"
-		    fi
-	    fi
+    case "$method" in
+        2022-*)
+            local expected=32 bytes
+            [[ "$method" == 2022-blake3-aes-128-gcm ]] && expected=16
+            bytes=$(printf '%s' "$ss_password" | openssl base64 -d -A | wc -c | tr -d ' ')
+            [[ "$bytes" == "$expected" ]] &&
+                [[ "$(printf '%s' "$ss_password" | openssl base64 -d -A | openssl base64 -A)" == "$ss_password" ]] || {
+                ss_error "$method 需要 Base64 编码的 $expected 字节密钥。"; return 1;
+            } ;;
+    esac
+    value=""
+    [[ -f "$SS_STATE_DIR/node_name" ]] && IFS= read -r value < "$SS_STATE_DIR/node_name"
+    if [[ -z "$value" && -f "$SS_STATE_DIR/info.txt" ]]; then
+        value=$(sed -n 's/^节点名称: //p' "$SS_STATE_DIR/info.txt" | head -n 1)
     fi
-    
-    # 询问用户是否修改节点名称
-    local current_node_name=""
-    if [ -f "/etc/shadowsocks/info.txt" ]; then
-        current_node_name=$(grep "节点名称:" "/etc/shadowsocks/info.txt" | cut -d ' ' -f 2-)
-    else
-        current_node_name="Shadowsocks-${current_method}"
+    read -r -p "节点名称（回车 ${value:-Shadowsocks-$method}）: " node_name || return 1
+    node_name=${node_name:-${value:-Shadowsocks-$method}}
+    # fast_open 关闭可减少对旧内核功能的依赖。
+    jq -n --argjson port "$ss_port" --arg password "$ss_password" --arg method "$method" \
+        '{server:"0.0.0.0",server_port:$port,mode:"tcp_and_udp",fast_open:false,password:$password,method:$method}' >&3
+}
+
+ss_write_config() {
+    local source=$1 temp
+    mkdir -p "$(dirname "$SS_CONFIG_PATH")" || return 1
+    temp=$(mktemp "${SS_CONFIG_PATH}.XXXXXX") || return 1
+    if install -m 600 "$source" "$temp" && mv -f "$temp" "$SS_CONFIG_PATH"; then return 0; fi
+    rm -f "$temp"
+    return 1
+}
+
+get_public_ip() {
+    public_ip=""
+    local endpoint
+    for endpoint in https://api.ipify.org https://api.ip.sb/ip https://icanhazip.com; do
+        public_ip=$(curl -fsS --connect-timeout 3 --max-time 5 "$endpoint" 2>/dev/null) || public_ip=""
+        # 只接受地址字符，阻止 HTML/错误页成为分享链接主机名。
+        [[ "$public_ip" =~ ^[0-9.]+$ || "$public_ip" =~ ^[0-9a-fA-F:]+$ ]] && break
+        public_ip=""
+    done
+    if [[ -z "$public_ip" ]]; then
+        public_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+        printf '未取得公网 IP，请把链接地址替换为服务器公网 IP。\n' >&2
     fi
-    
-    echo -e "${GREEN}当前节点名称: $current_node_name${PLAIN}"
-    read -p "是否修改节点名称？(y/n，默认n): " change_node_name
-    local new_node_name=$current_node_name
-    
-    if [[ "$change_node_name" == "y" || "$change_node_name" == "Y" ]]; then
-        read -p "请输入新的节点名称: " custom_node_name
-        if [[ -n "$custom_node_name" ]]; then
-            new_node_name="$custom_node_name"
+    public_ip=${public_ip:-YOUR_SERVER_IP}
+}
+
+ss_save_info() {
+    local host userinfo fragment
+    get_public_ip
+    host=$public_ip
+    [[ "$host" == *:* ]] && host="[$host]"
+    fragment=$(jq -rn --arg name "$node_name" '$name|@uri') || return 1
+    case "$method" in
+        2022-*)
+            userinfo="$(jq -rn --arg s "$method" '$s|@uri'):$(jq -rn --arg s "$ss_password" '$s|@uri')" ;;
+        *) userinfo=$(printf '%s' "$method:$ss_password" | base64 | tr -d '\n' | tr '+/' '-_' | tr -d '=') ;;
+    esac
+    final_url="ss://${userinfo}@${host}:${ss_port}#${fragment}"
+    printf '%s\n' "$node_name" > "$SS_STATE_DIR/node_name" || return 1
+    {
+        printf '后端: %s\n端口: %s\n密码: %s\n加密方法: %s\n节点名称: %s\n链接: %s\n' \
+            "$SS_BACKEND" "$ss_port" "$ss_password" "$method" "$node_name" "$final_url"
+    } > "$SS_STATE_DIR/info.txt" || return 1
+    printf '%s\n' "$final_url" > "$SS_STATE_DIR/latest_link.txt" || return 1
+    chmod 600 "$SS_STATE_DIR/"{info.txt,node_name,latest_link.txt} || return 1
+    printf '节点链接：%s\n' "$final_url"
+}
+
+ss_backup() {
+    local file
+    SS_BACKUP=$(mktemp -d "$SS_STATE_DIR/backups/$(date +%Y%m%d-%H%M%S).XXXXXX") || return 1
+    for file in "$SS_BINARY_CONFIG" "$SS_SNAP_CONFIG" "$SS_UNIT" /usr/local/bin/ssserver "$SS_BACKEND_FILE"; do
+        if [[ -e "$file" ]]; then
+            mkdir -p "$SS_BACKUP$(dirname "$file")" &&
+                cp -p "$file" "$SS_BACKUP$file" || return 1
         fi
-    fi
-    
-    # 更新配置文件
-    echo -e "${BLUE}正在更新配置文件...${PLAIN}"
-    cat <<EOF >$SS_CONFIG_PATH
-{
-    "server": "0.0.0.0",
-    "server_port": $new_port,
-    "password": "$new_password",
-    "method": "$new_method",
-    "fast_open": false,
-    "mode": "tcp_and_udp"
+    done
+    systemctl is-active --quiet shadowsocks.service && touch "$SS_BACKUP/binary.active"
+    systemctl is-active --quiet "snap.${SS_SNAP_APP}.service" && touch "$SS_BACKUP/snap.active"
+    systemctl is-enabled --quiet shadowsocks.service && touch "$SS_BACKUP/binary.enabled"
+    systemctl is-enabled --quiet "snap.${SS_SNAP_APP}.service" && touch "$SS_BACKUP/snap.enabled"
+    return 0
 }
-EOF
-    # 获取ip
-	get_public_ip
-    # 更新保存的配置信息
-    base64_password=$(echo -n "$new_method:$new_password" | base64 -w 0)
-    
-    cat <<EOF >/etc/shadowsocks/info.txt
-端口: $new_port
-密码: $new_password
-加密方法: $new_method
-节点名称: $new_node_name
-链接: ss://${base64_password}@${public_ip}:$new_port#$new_node_name
-EOF
-    
-    echo -e "${GREEN}配置已更新！${PLAIN}"
-    
-    # 重启服务
-    echo -e "${BLUE}正在重启 Shadowsocks 服务...${PLAIN}"
-    systemctl restart shadowsocks
-    
-    if [ $? -eq 0 ]; then
-        echo -e "${GREEN}Shadowsocks 服务已成功重启！${PLAIN}"
-        echo -e "${GREEN}新的节点链接: ss://${base64_password}@${public_ip}:$new_port#$new_node_name${PLAIN}"
+
+ss_restore_files() {
+    local file failed=0
+    for file in "$SS_BINARY_CONFIG" "$SS_SNAP_CONFIG" "$SS_UNIT" /usr/local/bin/ssserver "$SS_BACKEND_FILE"; do
+        if [[ -e "$SS_BACKUP$file" ]]; then
+            mkdir -p "$(dirname "$file")" && cp -p "$SS_BACKUP$file" "$file" || failed=1
+        elif [[ -e "$file" ]]; then
+            rm -f "$file" || failed=1
+        fi
+    done
+    systemctl daemon-reload || failed=1
+    return "$failed"
+}
+
+ss_rollback() {
+    local failed=0
+    ss_restore_files || failed=1
+    if [[ -f "$SS_BACKUP/binary.enabled" ]]; then systemctl enable shadowsocks.service || failed=1; fi
+    if [[ -f "$SS_BACKUP/snap.enabled" ]]; then snap start --enable "$SS_SNAP_APP" || failed=1; fi
+    if [[ -f "$SS_BACKUP/binary.active" ]]; then systemctl start shadowsocks.service || failed=1; fi
+    if [[ -f "$SS_BACKUP/snap.active" ]]; then snap start "$SS_SNAP_APP" || failed=1
+    elif [[ -f "$SS_BACKUP/snap.enabled" ]]; then snap stop "$SS_SNAP_APP" || failed=1; fi
+    if ((failed)); then ss_error "自动恢复未完全成功，请检查服务及备份：$SS_BACKUP"; return 1; fi
+    printf '已恢复原配置和原服务状态；备份：%s\n' "$SS_BACKUP" >&2
+}
+
+install_shadowsocks() (
+    check_root
+    check_system && check_tool || return 1
+    mkdir -p "$SS_STATE_DIR/backups" || return 1
+    chmod 700 "$SS_STATE_DIR" "$SS_STATE_DIR/backups" || return 1
+    exec 9>"$SS_STATE_DIR/.lock"
+    flock -n 9 || { ss_error "另一个管理操作正在执行。"; return 1; }
+    local previous="" temp requested choice candidate
+    if ss_detect_backend; then previous=$SS_BACKEND; else SS_CONFIG_PATH=$SS_BINARY_CONFIG; fi
+    requested=$SS_REQUESTED_BACKEND
+    if [[ "$requested" == auto && -t 0 ]]; then
+        read -r -p "安装方式 auto / binary / snap（回车 auto；已安装时沿用原后端）: " choice || return 1
+        requested=${choice:-auto}
+    fi
+    case "$requested" in auto|binary|snap) ;; *) ss_error "无效后端：$requested"; return 1 ;; esac
+    # 在子 shell 内部使用 EXIT 清理，不改变主菜单的 trap。
+    temp=$(mktemp -d) || return 1
+    trap 'rm -rf "$temp"' EXIT
+    # JSON 单独写入 fd 3，菜单和提示仍显示在终端。
+    ss_choose_config 3>"$temp/config.json" || return 1
+    ss_backup || return 1
+    trap 'ss_service disable >/dev/null 2>&1 || :; ss_rollback; exit 130' INT
+    trap 'ss_service disable >/dev/null 2>&1 || :; ss_rollback; exit 143' TERM
+    local candidates=()
+    case "$requested" in
+        auto)
+            if [[ "$previous" == snap ]]; then candidates=(snap)
+            else candidates=(binary snap); fi ;;
+        *) candidates=("$requested") ;;
+    esac
+    # 切换前停用两个后端，避免端口冲突；失败后恢复原配置与状态。
+    if [[ -f "$SS_UNIT" ]]; then
+        systemctl disable --now shadowsocks.service || { ss_rollback; return 1; }
+    fi
+    if ss_snap_installed; then
+        snap stop --disable "$SS_SNAP_APP" || { ss_rollback; return 1; }
+    fi
+    for candidate in "${candidates[@]}"; do
+        SS_BACKEND=$candidate
+        ss_set_config_path
+        printf '尝试安装后端：%s\n' "$candidate"
+        if "ss_install_$candidate" "$temp" &&
+            ss_write_config "$temp/config.json" &&
+            ss_service enable &&
+            ss_service restart &&
+            ss_wait_ready "$ss_port"; then
+            printf '%s\n' "$SS_BACKEND" > "$SS_BACKEND_FILE" || { ss_service disable; ss_rollback; return 1; }
+            trap - INT TERM
+            ss_save_info || { ss_error "服务已运行，但节点信息保存失败。"; return 1; }
+            printf '安装成功：%s；配置：%s；备份：%s\n' "$SS_BACKEND" "$SS_CONFIG_PATH" "$SS_BACKUP"
+            printf '请确保主机防火墙及云安全组允许 %s/TCP 和 %s/UDP。\n' "$ss_port" "$ss_port"
+            return 0
+        fi
+        printf '后端 %s 未成功启动。\n' "$candidate" >&2
+        local stopped=0
+        if { [[ "$candidate" == binary && -f "$SS_UNIT" ]]; } ||
+           { [[ "$candidate" == snap ]] && ss_snap_installed; }; then
+            ss_service disable || stopped=1
+        fi
+        if ((stopped)); then
+            ss_error "无法停止失败后端，为避免端口冲突，终止自动切换。"
+            ss_rollback
+            return 1
+        fi
+        ss_restore_files || { ss_error "恢复文件失败；备份：$SS_BACKUP"; return 1; }
+    done
+    ss_rollback
+    ss_error "所有候选后端均失败，未生成成功节点。"
+    return 1
+)
+
+check_shadowsocks_status() {
+    ss_detect_backend || { ss_error "未检测到安装。"; return 1; }
+    printf '后端：%s\n配置：%s\n' "$SS_BACKEND" "$SS_CONFIG_PATH"
+    if [[ "$SS_BACKEND" == snap ]]; then
+        snap list shadowsocks-rust
+        snap services "$SS_SNAP_APP"
     else
-        echo -e "${RED}重启 Shadowsocks 服务失败！${PLAIN}"
+        /usr/local/bin/ssserver --version
+        systemctl --no-pager -l status shadowsocks.service
     fi
 }
 
-# 启动Shadowsocks服务
-start_shadowsocks() {
-    if ! command -v ssserver &> /dev/null; then
-        echo -e "${RED}Shadowsocks 未安装，请先安装！${PLAIN}"
-        return 1
-    fi
-    
-    echo -e "${BLUE}正在启动 Shadowsocks 服务...${PLAIN}"
-    systemctl start shadowsocks
-    
-    if [ $? -eq 0 ]; then
-        echo -e "${GREEN}Shadowsocks 服务已成功启动！${PLAIN}"
-        return 0
-    else
-        echo -e "${RED}启动 Shadowsocks 服务失败！${PLAIN}"
-        return 1
-    fi
+check_shadowsocks_config() {
+    ss_detect_backend || return 1
+    printf '配置文件：%s\n' "$SS_CONFIG_PATH"
+    [[ -f "$SS_CONFIG_PATH" ]] && cat "$SS_CONFIG_PATH"
+    [[ -f "$SS_STATE_DIR/info.txt" ]] && cat "$SS_STATE_DIR/info.txt"
 }
 
-# 停止Shadowsocks服务
-stop_shadowsocks() {
-    if ! systemctl is-active shadowsocks &>/dev/null; then
-        echo -e "${YELLOW}Shadowsocks 服务当前未运行${PLAIN}"
-        return 0
-    fi
-    
-    echo -e "${BLUE}正在停止 Shadowsocks 服务...${PLAIN}"
-    systemctl stop shadowsocks
-    
-    if [ $? -eq 0 ]; then
-        echo -e "${GREEN}Shadowsocks 服务已成功停止！${PLAIN}"
-        return 0
+modify_shadowsocks_config() (
+    check_system && check_tool && ss_detect_backend || return 1
+    exec 9>"$SS_STATE_DIR/.lock"
+    flock -n 9 || { ss_error "另一个管理操作正在执行。"; return 1; }
+    local temp
+    temp=$(mktemp -d) || return 1
+    trap 'rm -rf "$temp"' EXIT
+    [[ -f "$SS_CONFIG_PATH" ]] || { ss_error "配置文件不存在。"; return 1; }
+    ss_choose_config 3>"$temp/config.json" || return 1
+    cp -p "$SS_CONFIG_PATH" "$temp/old.json" || return 1
+    if ss_write_config "$temp/config.json" && ss_service restart && ss_wait_ready "$ss_port"; then
+        ss_save_info
     else
-        echo -e "${RED}停止 Shadowsocks 服务失败！${PLAIN}"
+        ss_write_config "$temp/old.json" && ss_service restart || ss_error "恢复失败。"
+        ss_error "新配置启动失败，已尝试恢复旧配置。"
         return 1
     fi
-}
+)
 
-# 重启Shadowsocks服务
-restart_shadowsocks() {
-    if ! command -v ssserver &> /dev/null; then
-        echo -e "${RED}Shadowsocks 未安装，请先安装！${PLAIN}"
-        return 1
-    fi
-    
-    echo -e "${BLUE}正在重启 Shadowsocks 服务...${PLAIN}"
-    systemctl restart shadowsocks
-    
-    if [ $? -eq 0 ]; then
-        echo -e "${GREEN}Shadowsocks 服务已成功重启！${PLAIN}"
-        return 0
+start_shadowsocks() { ss_detect_backend && ss_service start; }
+stop_shadowsocks() { ss_detect_backend && ss_service stop; }
+restart_shadowsocks() { ss_detect_backend && ss_service restart; }
+
+uninstall_shadowsocks() (
+    ss_detect_backend || { ss_error "未检测到安装。"; return 1; }
+    local confirm
+    read -r -p "卸载 $SS_BACKEND 后端？备份和节点信息将保留 (y/N): " confirm || return 1
+    [[ "$confirm" == y || "$confirm" == Y ]] || return 1
+    exec 9>"$SS_STATE_DIR/.lock"
+    flock -n 9 || return 1
+    ss_service disable || return 1
+    if [[ "$SS_BACKEND" == snap ]]; then
+        # 不使用 --purge，保留 Snap 自动快照。
+        snap remove shadowsocks-rust || return 1
     else
-        echo -e "${RED}重启 Shadowsocks 服务失败！${PLAIN}"
-        return 1
+        rm -f "$SS_UNIT" /usr/local/bin/ssserver "$SS_BINARY_CONFIG" || return 1
+        systemctl daemon-reload || return 1
     fi
-}
+    rm -f "$SS_BACKEND_FILE"
+    printf '已卸载选定后端，/etc/shadowsocks 中的信息和备份已保留。\n'
+)
 
-# 卸载Shadowsocks服务
-uninstall_shadowsocks() {
-    echo -e "${YELLOW}警告: 此操作将完全卸载 Shadowsocks 服务及其配置文件！${PLAIN}"
-    read -p "是否继续？(y/n): " confirm
-    
-    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
-        echo -e "${GREEN}已取消卸载${PLAIN}"
-        return 0
+ss_links() {
+    ss_detect_backend || return 1
+    [[ -f "$SS_CONFIG_PATH" ]] || return 1
+    ss_port=$(jq -er '.server_port' "$SS_CONFIG_PATH") || return 1
+    method=$(jq -er '.method' "$SS_CONFIG_PATH") || return 1
+    ss_password=$(jq -er '.password' "$SS_CONFIG_PATH") || return 1
+    node_name="Shadowsocks-$method"
+    [[ -f "$SS_STATE_DIR/node_name" ]] && IFS= read -r node_name < "$SS_STATE_DIR/node_name"
+    ss_save_info
+    if systemctl is-active --quiet shadow-tls; then
+        printf 'ShadowTLS 已运行；以上为 SS 直连链接，ShadowTLS 客户端参数见 /etc/shadowtls/info.txt。\n'
     fi
-    
-    echo -e "${BLUE}正在卸载 Shadowsocks 服务...${PLAIN}"
-    
-    # 停止 Shadowsocks 服务
-    if systemctl is-active shadowsocks &>/dev/null; then
-        echo -e "${BLUE}停止 Shadowsocks 服务...${PLAIN}"
-        systemctl stop shadowsocks
-    fi
-    
-    # 禁用 Shadowsocks 服务自启动
-    if systemctl is-enabled shadowsocks &>/dev/null; then
-        echo -e "${BLUE}禁用 Shadowsocks 服务自启动...${PLAIN}"
-        systemctl disable shadowsocks &>/dev/null
-    fi
-    
-    # 删除 Shadowsocks 服务文件并重新加载 systemd 配置
-    if [ -f "/etc/systemd/system/shadowsocks.service" ]; then
-        echo -e "${BLUE}删除 Shadowsocks 服务文件...${PLAIN}"
-        rm /etc/systemd/system/shadowsocks.service
-        systemctl daemon-reload
-    fi
-    
-    # 删除 Shadowsocks 相关配置文件及目录和可执行文件
-    echo -e "${BLUE}删除 Shadowsocks 相关文件...${PLAIN}"
-    if [ -d "/etc/shadowsocks" ]; then
-        rm -rf /etc/shadowsocks
-    fi
-    
-    if command -v ssserver &> /dev/null; then
-        rm /usr/local/bin/ssserver
-    fi
-    
-    if command -v sslocal &> /dev/null; then
-        rm /usr/local/bin/sslocal
-    fi
-    
-    if command -v ssurl &> /dev/null; then
-        rm /usr/local/bin/ssurl
-    fi
-    
-    if command -v ssmanager &> /dev/null; then
-        rm /usr/local/bin/ssmanager
-    fi
-    
-    echo -e "${GREEN}Shadowsocks 服务已成功卸载！${PLAIN}"
 }
 
 # ===== ShadowTLS 功能 =====
 
 # 安装ShadowTLS服务
 install_shadowtls() {
+    check_system && check_tool || return 1
+    ss_detect_backend || { ss_error "请先安装 Shadowsocks。"; return 1; }
     echo -e "${BLUE}开始安装 ShadowTLS 服务...${PLAIN}"
 
     # 检查是否已安装
-    if [ -f "/usr/bin/shadow-tls-x86_64-unknown-linux-musl" ] || systemctl is-active shadow-tls &>/dev/null; then
+    if [ -f "/usr/bin/shadow-tls" ] || systemctl is-active shadow-tls &>/dev/null; then
         echo -e "${YELLOW}ShadowTLS 已安装，如需重新安装请先卸载${PLAIN}"
         return 1
     fi
@@ -694,6 +573,7 @@ install_shadowtls() {
     read -p "输入TLS混淆域名（默认www.bing.com）: " tls_domain
     local tls_domain=${tls_domain:-www.bing.com}
 
+    ss_validate_shadowtls || return 1
     # 创建服务文件
     cat > /etc/systemd/system/shadow-tls.service <<EOF
 [Unit]
@@ -711,7 +591,7 @@ EOF
 
     # 启动服务
     systemctl daemon-reload
-    systemctl enable shadow-tls --now
+    systemctl enable shadow-tls --now && sleep 2 && systemctl is-active --quiet shadow-tls
 
     if [ $? -eq 0 ]; then
         echo -e "${GREEN}ShadowTLS 启动成功！${PLAIN}"
@@ -726,20 +606,11 @@ TLS域名: $tls_domain
 EOF
         echo -e "${GREEN}配置信息已保存至 /etc/shadowtls/info.txt${PLAIN}"
 
-    # 构建并输出 ss:// 格式的链接
-    local current_port=$(jq -r '.server_port' "$SS_CONFIG_PATH")
-    local current_method=$(jq -r '.method' "$SS_CONFIG_PATH")
-    local current_password=$(jq -r '.password' "$SS_CONFIG_PATH")
-    local current_node_name=$(grep "节点名称:" "/etc/shadowsocks/info.txt" | cut -d ' ' -f 2-)
-	get_public_ip
-    base64_password=$(echo -n "$current_method:$current_password" | base64 -w 0)
-	shadow_tls_config="{\"version\":\"3\",\"password\":\"${stls_password}\",\"host\":\"${tls_domain}\",\"port\":\"${listen_port}\",\"address\":\"${public_ip}\"}"
-	shadow_tls_base64=$(echo -n "${shadow_tls_config}" | base64 | tr -d '\n')
-	final_url="ss://${base64_password}@${public_ip}:${current_port}?shadow-tls=${shadow_tls_base64}#$current_node_name${PLAIN}"
-    echo -e "${GREEN}Shadowsocks 节点信息: ${final_url}"
-	# 将链接写入文件
-    echo "$final_url" > /etc/shadowsocks/latest_link.txt
-    echo -e "\n${YELLOW}链接已保存至：/etc/shadowsocks/latest_link.txt${PLAIN}"
+        printf 'ShadowTLS 参数：地址=服务器公网IP，端口=%s，版本=3，密码=%s，TLS域名=%s\n' \
+            "$listen_port" "$stls_password" "$tls_domain"
+        printf '客户端须分别配置 ShadowTLS 和其后的 Shadowsocks；直接 SS 链接可由主菜单生成。\n'
+        chmod 700 /etc/shadowtls
+        chmod 600 /etc/shadowtls/info.txt
     else
         echo -e "${RED}ShadowTLS 启动失败！${PLAIN}"
         return 1
@@ -769,6 +640,8 @@ check_shadowtls_config() {
 
 # 修改ShadowTLS配置
 modify_shadowtls_config() {
+    check_system && check_tool || return 1
+    ss_detect_backend || return 1
     if [ ! -f "/usr/bin/shadow-tls" ]; then
         echo -e "${RED}ShadowTLS 未安装${PLAIN}"
         return 1
@@ -820,6 +693,7 @@ modify_shadowtls_config() {
     read -p "新TLS域名: " new_tls_domain
     tls_domain=${new_tls_domain:-$current_tls_domain}
     
+    ss_validate_shadowtls || return 1
     # 更新服务文件
     cat > /etc/systemd/system/shadow-tls.service <<EOF
 [Unit]
@@ -844,7 +718,7 @@ TLS域名: ${tls_domain}
 EOF
 
     systemctl daemon-reload
-    systemctl restart shadow-tls
+    systemctl restart shadow-tls && sleep 2 && systemctl is-active --quiet shadow-tls || return 1
     
     echo -e "${GREEN}ShadowTLS 配置已更新并重启服务${PLAIN}"
 }
@@ -867,6 +741,8 @@ shadowtls_control() {
 
 # 卸载ShadowTLS
 uninstall_shadowtls() {
+    check_system && check_tool || return 1
+    ss_detect_backend || { ss_error "请先安装 Shadowsocks。"; return 1; }
     echo -e "${YELLOW}此操作将完全卸载 ShadowTLS${PLAIN}"
     read -p "确认卸载？(y/n): " confirm
     [[ "$confirm" != "y" ]] && return
@@ -880,80 +756,75 @@ uninstall_shadowtls() {
     echo -e "${GREEN}ShadowTLS 已卸载${PLAIN}"
 }
 
-# ===== 主菜单功能 =====
 
-# 一键安装
-# 输出当前节点链接
-ss_links() {
-    # 检查 Shadowsocks 是否安装
-    if [ ! -f "$SS_CONFIG_PATH" ]; then
-        echo -e "${RED}Shadowsocks 未安装，请先安装！${PLAIN}"
-        return 1
-    fi
-    
-    # 读取 Shadowsocks 配置
-    ss_port=$(jq -r '.server_port' "$SS_CONFIG_PATH")
-    ss_password=$(jq -r '.password' "$SS_CONFIG_PATH")
-    method=$(jq -r '.method' "$SS_CONFIG_PATH")
-    get_public_ip
-    # 获取节点名称
-    node_name=$(grep "节点名称:" "/etc/shadowsocks/info.txt" | cut -d ' ' -f 2-)
-    
-    # 生成基础 ss:// 信息
-    base64_password=$(echo -n "${method}:${ss_password}" | base64 -w 0)
-    
-    # 检查 ShadowTLS 是否安装并正在运行
-    if systemctl is-active --quiet shadow-tls && [ -f "$STLS_CONFIG_PATH" ]; then
-        # 读取 ShadowTLS 配置
-        stls_port=$(grep "监听端口:" /etc/shadowtls/info.txt | awk '{print $2}')
-        stls_password=$(grep "密码:" /etc/shadowtls/info.txt | awk '{print $2}')
-        tls_domain=$(grep "TLS域名:" /etc/shadowtls/info.txt | awk '{print $2}')
-        
-        if [ -n "$stls_port" ] && [ -n "$stls_password" ] && [ -n "$tls_domain" ]; then
-            # 构建 ShadowTLS 参数
-            shadow_tls_config="{\"version\":\"3\",\"password\":\"${stls_password}\",\"host\":\"${tls_domain}\"}"
-            shadow_tls_base64=$(echo -n "$shadow_tls_config" | base64 -w 0 | tr -d '\n')
-            
-            # 组合最终链接 (注意: ShadowTLS链接使用stls_port而不是ss_port)
-            final_url="ss://${base64_password}@${public_ip}:${ss_port}?shadow-tls=${shadow_tls_base64}#${node_name}"
-            
-            echo -e "${GREEN}当前节点链接 (ShadowTLS)：${PLAIN}"
-            echo -e "${BLUE}${final_url}${PLAIN}"
-        else
-            echo -e "${YELLOW}ShadowTLS配置信息不完整，使用普通链接。${PLAIN}"
-            # 普通 Shadowsocks 链接
-            final_url="ss://${base64_password}@${public_ip}:${ss_port}#${node_name}"
-            echo -e "${GREEN}当前节点链接 (普通)：${PLAIN}"
-            echo -e "${BLUE}${final_url}${PLAIN}"
-        fi
-    else
-        # 普通 Shadowsocks 链接
-        final_url="ss://${base64_password}@${public_ip}:${ss_port}#${node_name}"
-        echo -e "${GREEN}当前节点链接 (普通)：${PLAIN}"
-        echo -e "${BLUE}${final_url}${PLAIN}"
-    fi
-    
-    # 添加暂停
-    read -n 1 -s -r -p "按任意键返回主菜单..."
+
+ss_validate_shadowtls() {
+    local value
+    for value in "$listen_port" "$ss_port"; do
+        [[ "$value" =~ ^[0-9]{1,5}$ ]] && ((10#$value >= 1 && 10#$value <= 65535)) || {
+            ss_error "ShadowTLS 端口无效。"; return 1;
+        }
+    done
+    ((10#$listen_port != 10#$ss_port)) || {
+        ss_error "ShadowTLS 监听端口不能与 SS 目标端口相同。"; return 1;
+    }
+    [[ "$tls_domain" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]*$ ]] &&
+        [[ "$stls_password" =~ ^[a-zA-Z0-9._~+=/@:-]+$ ]] || {
+        ss_error "TLS 域名或密码包含服务文件不支持的字符；密码请使用字母、数字及 ._~+=/@:-。"; return 1;
+    }
 }
-# 完全卸载
+
 install_all() {
-    check_root
-	install_shadowsocks
-	install_shadowtls
-	# 添加暂停
-    read -n 1 -s -r -p "按任意键返回主菜单..."
+    install_shadowsocks && install_shadowtls
 }
 
 uninstall_all() {
-    check_root
-    uninstall_shadowsocks
+    uninstall_shadowsocks || return 1
     uninstall_shadowtls
-    echo -e "${YELLOW}正在删除本脚本...${PLAIN}"
-    rm -f "$0"
-    echo -e "${GREEN}所有组件及脚本已卸载！${PLAIN}"
-    exit 0
 }
+
+usage() {
+    cat <<'HELP'
+用法：
+  sudo bash Shadowsocks-Auto.sh                  交互菜单
+  sudo bash Shadowsocks-Auto.sh install [auto|binary|snap]
+  sudo bash Shadowsocks-Auto.sh status
+  sudo bash Shadowsocks-Auto.sh config
+  sudo bash Shadowsocks-Auto.sh modify
+  sudo bash Shadowsocks-Auto.sh start|stop|restart|link|uninstall
+
+auto：优先 musl 二进制，失败后尝试 Snap；已安装 Snap 则沿用 Snap。
+snap：Debian/Ubuntu 上通过 snapd 安装，配置写入 Snap 的 common 目录。
+SS_BACKEND_MODE=snap 也可指定菜单默认安装方式。
+安装或修改时输入端口、加密方法、密码和节点名称；密码留空会随机生成。
+HELP
+}
+
+main() {
+    case "${1:-menu}" in help|-h|--help) usage; return ;; esac
+    check_root
+    check_system || return 1
+    umask 077
+    ss_detect_backend || :
+    case "${1:-menu}" in
+        menu) main_menu ;;
+        install) SS_REQUESTED_BACKEND=${2:-$SS_REQUESTED_BACKEND}; install_shadowsocks ;;
+        status) check_shadowsocks_status ;;
+        config) check_shadowsocks_config ;;
+        modify) modify_shadowsocks_config ;;
+        start) start_shadowsocks ;;
+        stop) stop_shadowsocks ;;
+        restart) restart_shadowsocks ;;
+        link) check_tool && ss_links ;;
+        uninstall) uninstall_shadowsocks ;;
+        *) usage; return 1 ;;
+    esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    set -o pipefail
+    main "$@"
+fi
 
 # 主菜单
 main_menu() {
@@ -966,11 +837,11 @@ main_menu() {
         echo -e "  2) ShadowTLS 服务管理"
         echo -e "  3) 一键安装 Shadowsocks+ShadowTLS"
         echo -e "  4) 输出当前节点链接"
-        echo -e "  9) 完全卸载（包含本脚本）"
+        echo -e "  9) 卸载组件（保留本脚本及 SS 备份）"
         echo -e "  0) 退出脚本"
         echo -e "${BLUE}================================${PLAIN}"
         
-        read -p "请输入选项: " main_choice
+        read -r -p "请输入选项: " main_choice || return
         case $main_choice in
             1) ss_submenu ;;
             2) stls_submenu ;;
@@ -998,7 +869,7 @@ ss_submenu() {
         echo -e "  9) 卸载Shadowsocks服务"
         echo -e "  0) 返回主菜单"
         
-        read -p "请输入选项: " choice
+        read -r -p "请输入选项: " choice || return
         case $choice in
             1) install_shadowsocks ;;
             2) check_shadowsocks_status ;;
@@ -1032,7 +903,7 @@ stls_submenu() {
         echo -e "  9) 卸载ShadowTLS服务"
         echo -e "  0) 返回主菜单"
         
-        read -p "请输入选项: " choice
+        read -r -p "请输入选项: " choice || return
         case $choice in
             1) install_shadowtls ;;
             2) check_shadowtls_status ;;
@@ -1050,7 +921,3 @@ stls_submenu() {
         fi
     done
 }
-
-# 脚本入口
-check_root
-main_menu
