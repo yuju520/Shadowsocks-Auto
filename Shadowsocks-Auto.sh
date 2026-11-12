@@ -821,11 +821,6 @@ main() {
     esac
 }
 
-if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
-    set -o pipefail
-    main "$@"
-fi
-
 # 主菜单
 main_menu() {
     while true; do
@@ -921,3 +916,9 @@ stls_submenu() {
         fi
     done
 }
+
+# 所有菜单函数定义完成后再执行入口。
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    set -o pipefail
+    main "$@"
+fi
